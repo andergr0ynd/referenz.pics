@@ -5,7 +5,7 @@
 
 script_name('referenz.pics')
 script_author('referenz.pics')
-script_version('2.77')
+script_version('2.78')
 
 local ffi = require 'ffi'
 local inicfg = require 'inicfg'
@@ -2099,15 +2099,19 @@ end
 
 function azCleanupOld()
   pcall(function()
+    local invalid = ffi.cast('void*', -1)
     for _, mask in ipairs({ 'cmd_*.txt', 'state_*.txt' }) do
-      local h, f = findFirstFile(AZ_DIR .. '\\' .. mask)
-      local names = {}
-      while f do
-        names[#names + 1] = f
-        f = findNextFile(h)
+      local data = ffi.new('WIN32_FIND_DATAA')
+      local h = kernel32.FindFirstFileA(AZ_DIR .. '\\' .. mask, data)
+      if h ~= nil and h ~= invalid then
+        repeat
+          local name = ffi.string(data.cFileName)
+          if name ~= '.' and name ~= '..' then
+            pcall(os.remove, AZ_DIR .. '\\' .. name)
+          end
+        until kernel32.FindNextFileA(h, data) == 0
+        kernel32.FindClose(h)
       end
-      if h then findClose(h) end
-      for _, n in ipairs(names) do os.remove(AZ_DIR .. '\\' .. n) end
     end
   end)
 end
@@ -2118,28 +2122,6 @@ function azFail(msg)
   az.status = 'fatal'
   az.err = msg
   az.shown = false
-end
-
-function azIsFullscreen()
-  local ok, res = pcall(function()
-    local pdev = readMemory(0xC97C28, 4, false)
-    if not pdev or pdev == 0 then return nil end
-    local dev = ffi.cast('void**', pdev)
-    if dev[0] == nil then return nil end
-    local vtbl = ffi.cast('void**', dev[0])
-    local get_sc = ffi.cast('int(__stdcall*)(void*, unsigned int, void**)', vtbl[14])
-    local out = ffi.new('void*[1]')
-    if get_sc(dev, 0, out) ~= 0 or out[0] == nil then return nil end
-    local sc = out[0]
-    local scvt = ffi.cast('void**', ffi.cast('void**', sc)[0])
-    local pp = ffi.new('unsigned int[16]')
-    local r = ffi.cast('int(__stdcall*)(void*, void*)', scvt[9])(sc, pp)
-    ffi.cast('unsigned long(__stdcall*)(void*)', scvt[2])(sc)
-    if r ~= 0 then return nil end
-    return pp[8] == 0
-  end)
-  if ok then return res end
-  return nil
 end
 
 function azStartSetup()
@@ -2163,8 +2145,8 @@ function azStartHelper()
   kernel32.CreateDirectoryA(AZ_DIR, nil)
   azKillHelper()
   azCleanupOld()
-  local fs = azIsFullscreen()
-  az.gm = (fs ~= false)
+  -- Без DirectX/COM: в MoonLoader это даёт cannot resume non-suspended coroutine.
+  az.gm = true
   az.loaded, az.frame, az.shown, az.wait = false, false, false, 0
   az.ready_nav = false
   az.sid = tostring(os.time() % 100000) .. tostring(math.random(100, 999))
@@ -2172,7 +2154,7 @@ function azStartHelper()
   az.state = AZ_DIR .. '\\state_' .. az.sid .. '.txt'
   az.sent, az.tick, az.title = {}, nil, ''
   azWrite(az.cmd, '')
-  azLog('запуск WebView2: ' .. (az.gm and 'полноэкранный' or 'оконный'))
+  azLog('запуск WebView2: полноэкранный')
   azWrite(AZ_DIR .. '\\helper.ps1', blobs.helper_ps)
   azWrite(AZ_DIR .. '\\helper.cs', blobs.helper_cs)
   local cmd = string.format('"%s" -NoProfile -NonInteractive -ExecutionPolicy Bypass -STA -File "%s\\helper.ps1" "%s" %.0f %d %s %d',
@@ -2496,11 +2478,17 @@ function killBrowseHelper()
 end
 
 function pumpBrowse()
-  local ok, err = pcall(azPollState)
-  if not ok then
-    azLog('poll: ' .. tostring(err))
+  if az.pumping then return end
+  az.pumping = true
+  local now = os.clock()
+  if now - (az.poll_at or 0) >= 0.3 then
+    az.poll_at = now
+    local ok, err = pcall(azPollState)
+    if not ok then azLog('poll: ' .. tostring(err)) end
   end
-  pcall(azSyncView)
+  local ok2, err2 = pcall(azSyncView)
+  if not ok2 then azLog('sync: ' .. tostring(err2)) end
+  az.pumping = false
 end
 
 function authHead()
@@ -4508,6 +4496,7 @@ function main()
   end
   startAutoUpdate()
   while true do
+    wait(0)
     if cefOpen or az.status == 'setup' or az.status == 'starting' or az.status == 'ready' or az.pending then
       pumpBrowse()
     end
@@ -4521,7 +4510,6 @@ function main()
     end
     pumpThumbs()
     pumpLogo()
-    wait(0)
     flushClip()
     pollQuietLogin()
     if dropHub then
