@@ -2,10 +2,14 @@
 
 F8 в игре — кадр уже на сайте.
 
-Скрипт для MoonLoader. Версия **2.17**. Нужны SAMP и [MoonLoader](https://www.blast.hk/threads/33418/).
+Скрипт для MoonLoader. Версия **2.74**. Нужны SAMP и [MoonLoader](https://www.blast.hk/threads/33418/).
 
 Сайт: [referenz.pics](https://referenz.pics)  
 Тема на BlastHack: [инструкция и обсуждение](https://www.blast.hk/threads/257840/#post-1696751)
+
+<p align="center">
+  <img src="images/logo.png" alt="referenz.pics" width="160" />
+</p>
 
 ![referenz.pics](images/banner.png)
 
@@ -56,6 +60,7 @@ F8 в игре — кадр уже на сайте.
 | `/referenz` | Открыть окно |
 | `/pics` | То же самое |
 | `/referenz logout` | Выйти из аккаунта и открыть окно входа |
+| `/referenz update` или `/refupdate` | Проверить обновление скрипта |
 
 ## Если что-то не так
 
@@ -67,4 +72,4 @@ F8 в игре — кадр уже на сайте.
 
 ## Обновление
 
-Скачайте новый `referenz.pics.lua`, замените старый в `moonloader` и нажмите Ctrl+R. Логин в `moonloader/config/referenz.ini` при этом не стирается.
+Скрипт сам проверяет новую версию после спавна. Вручную: `/referenz update` или `/refupdate`, потом Ctrl+R. Можно и скачать `referenz.pics.lua` с GitHub вручную. Логин в `moonloader/config/referenz.ini` не стирается.
