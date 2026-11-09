@@ -5,7 +5,7 @@
 
 script_name('referenz.pics')
 script_author('referenz.pics')
-script_version('2.76')
+script_version('2.77')
 
 local ffi = require 'ffi'
 local inicfg = require 'inicfg'
@@ -1980,9 +1980,25 @@ end
 function azRead(path)
   local f = io.open(path, 'rb')
   if not f then return nil end
-  local s = f:read('*a')
+  local ok, s = pcall(function() return f:read('*a') end)
   f:close()
+  if not ok or type(s) ~= 'string' or s == '' then return nil end
   return s
+end
+
+function azParseState(s)
+  local st = {}
+  s = tostring(s or '')
+  local pos = 1
+  while true do
+    local a, b = s:find('[^\r\n]+', pos)
+    if not a then break end
+    local line = s:sub(a, b)
+    pos = b + 1
+    local k, v = line:match('^(%S+) ?(.*)$')
+    if k then st[k] = v end
+  end
+  return st
 end
 
 function azAppend(path, s)
@@ -2212,11 +2228,7 @@ function azPollState()
     if az.status == 'starting' and os.clock() - az.started_at > 60 then azFail('помощник не запустился') end
     return
   end
-  local st = {}
-  for line in s:gmatch('[^\r\n]+') do
-    local k, v = line:match('^(%S+) ?(.*)$')
-    if k then st[k] = v end
-  end
+  local st = azParseState(s)
   if st.fatal then return azFail(st.fatal) end
   if st.recover then
     azLog('recover: ' .. tostring(st.recover))
@@ -2484,8 +2496,11 @@ function killBrowseHelper()
 end
 
 function pumpBrowse()
-  azPollState()
-  azSyncView()
+  local ok, err = pcall(azPollState)
+  if not ok then
+    azLog('poll: ' .. tostring(err))
+  end
+  pcall(azSyncView)
 end
 
 function authHead()

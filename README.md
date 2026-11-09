@@ -2,7 +2,7 @@
 
 F8 в игре — кадр уже на сайте.
 
-Скрипт для MoonLoader. Версия **2.76**. Нужны SAMP и [MoonLoader](https://www.blast.hk/threads/33418/).
+Скрипт для MoonLoader. Версия **2.77**. Нужны SAMP и [MoonLoader](https://www.blast.hk/threads/33418/).
 
 Сайт: [referenz.pics](https://referenz.pics)  
 Тема на BlastHack: [инструкция и обсуждение](https://www.blast.hk/threads/257840/#post-1696751)
