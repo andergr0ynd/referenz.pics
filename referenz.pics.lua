@@ -5,7 +5,7 @@
 
 script_name('referenz.pics')
 script_author('referenz.pics')
-script_version('2.75')
+script_version('2.76')
 
 local ffi = require 'ffi'
 local inicfg = require 'inicfg'
@@ -82,6 +82,7 @@ if imgui then
   ui.cefBar = imgui.new.bool(true)
   ui.rail = imgui.new.bool(true)
   ui.side = imgui.new.bool(true)
+  ui.autoUpdate = imgui.new.bool(tostring(cfg.referenz.autoUpdate or '1') ~= '0')
   pcall(ffi.fill, ui.imgbb, 80)
   ui.ready = 'mimgui'
 elseif old_imgui then
@@ -609,7 +610,7 @@ function doLogout()
 end
 
 local WIN_W = 400
-local WIN_H = 500
+local WIN_H = 560
 
 local PAL = {
   gold = { 0.894, 0.757, 0.353, 1 },
@@ -734,6 +735,196 @@ function drawHostSwitch(lib, w, h)
   one('imgbb', 'ImgBB')
 end
 
+local LOGO_URL = 'https://raw.githubusercontent.com/andergr0ynd/referenz.pics/refs/heads/main/images/logo-256.png'
+local LOGO_URL_CDN = 'https://cdn.jsdelivr.net/gh/andergr0ynd/referenz.pics@main/images/logo-256.png'
+local LOGO_PATH = getWorkingDirectory() .. '\\images\\referenz-logo.png'
+local FORUM_URL = 'https://www.blast.hk/threads/257840/#post-1696751'
+local logo = {
+  tex = nil,
+  kick = false,
+  fetched = false,
+  busy = false,
+  job = nil,
+}
+
+function ensureDir(path)
+  if type(doesDirectoryExist) == 'function' and doesDirectoryExist(path) then return end
+  if type(createDirectory) == 'function' then
+    pcall(createDirectory, path)
+    return
+  end
+  pcall(function() kernel32.CreateDirectoryA(path, nil) end)
+end
+
+function logoIsPng(path)
+  local f = io.open(path, 'rb')
+  if not f then return false end
+  local head = f:read(8)
+  local size = f:seek('end') or 0
+  f:close()
+  if not head or #head < 4 then return false end
+  return head:byte(1) == 137 and head:byte(2) == 80 and head:byte(3) == 78 and head:byte(4) == 71 and size > 1500
+end
+
+function loadLogoTex()
+  if logo.tex or not imgui then return end
+  if not logoIsPng(LOGO_PATH) then return end
+  local ok, tex = pcall(imgui.CreateTextureFromFile, LOGO_PATH)
+  if ok and tex then logo.tex = tex end
+end
+
+function applyLogoPart()
+  local part = LOGO_PATH .. '.part'
+  if not logoIsPng(part) then
+    pcall(os.remove, part)
+    logo.busy = false
+    return
+  end
+  pcall(os.remove, LOGO_PATH)
+  if not os.rename(part, LOGO_PATH) then
+    pcall(function()
+      local src = io.open(part, 'rb')
+      local dst = io.open(LOGO_PATH, 'wb')
+      if src and dst then dst:write(src:read('*a')) end
+      if src then src:close() end
+      if dst then dst:close() end
+      os.remove(part)
+    end)
+  else
+    pcall(os.remove, part)
+  end
+  logo.busy = false
+  logo.tex = nil
+  loadLogoTex()
+end
+
+function fetchLogo()
+  if logo.busy or logo.fetched then return end
+  logo.fetched = true
+  logo.busy = true
+  ensureDir(getWorkingDirectory() .. '\\images')
+  local part = LOGO_PATH .. '.part'
+  pcall(os.remove, part)
+  if type(downloadUrlToFile) == 'function' then
+    local ml = require('moonloader')
+    local ds = ml and ml.download_status
+    logo.job = { done = false, ok = false, t0 = os.clock(), url = 1 }
+    local job = logo.job
+    local urls = { LOGO_URL, LOGO_URL_CDN }
+    pcall(downloadUrlToFile, urls[1] .. '?t=' .. tostring(os.time()), part, function(_, status)
+      if not ds or not job then return end
+      if status == ds.STATUS_ENDDOWNLOADDATA or status == ds.STATUSEX_ENDDOWNLOAD then
+        job.done = true
+        job.ok = true
+      end
+    end)
+    return
+  end
+  lua_thread.create(function()
+    local body = updateFetch and updateFetch({ LOGO_URL, LOGO_URL_CDN }, 1500) or nil
+    if type(body) ~= 'string' or #body < 1500
+      or body:byte(1) ~= 137 or body:byte(2) ~= 80 or body:byte(3) ~= 78 or body:byte(4) ~= 71 then
+      logo.busy = false
+      return
+    end
+    pcall(function()
+      local f = io.open(part, 'wb')
+      if f then
+        f:write(body)
+        f:close()
+      end
+    end)
+    applyLogoPart()
+  end)
+end
+
+function pumpLogo()
+  local job = logo.job
+  if not job then return end
+  if job.done then
+    logo.job = nil
+    if job.ok then
+      applyLogoPart()
+    else
+      pcall(os.remove, LOGO_PATH .. '.part')
+      logo.busy = false
+    end
+    return
+  end
+  if os.clock() - (job.t0 or 0) > 25 then
+    logo.job = nil
+    pcall(os.remove, LOGO_PATH .. '.part')
+    logo.busy = false
+  end
+end
+
+function kickLogo()
+  if logo.kick then return end
+  logo.kick = true
+  loadLogoTex()
+  if not logo.tex then fetchLogo() end
+end
+
+function openForumTopic()
+  pcall(ffi.cdef, [[
+    void* __stdcall ShellExecuteA(void* hwnd, const char* op, const char* file,
+      const char* params, const char* dir, int show);
+  ]])
+  local opened = false
+  pcall(function()
+    ffi.load('Shell32').ShellExecuteA(nil, 'open', FORUM_URL, nil, nil, 1)
+    opened = true
+  end)
+  if not opened then
+    os.execute('cmd /c start "" "' .. FORUM_URL .. '"')
+  end
+end
+
+function drawBrandHeader(lib, width, withVersion)
+  kickLogo()
+  width = width or 120
+  local h = 0
+  if logo.tex and lib.Image then
+    local logoW = math.min(108, width)
+    local logoH = math.floor(logoW * 9 / 16)
+    if logoH < 48 then logoH = 48 end
+    lib.Image(logo.tex, lib.ImVec2(logoW, logoH))
+    h = logoH + 6
+    if lib.Dummy then lib.Dummy(lib.ImVec2(0, 4)) end
+  end
+  if lib.TextColored then
+    lib.TextColored(v4(lib, PAL.text), 'referenz')
+    lib.SameLine(0, 0)
+    lib.TextColored(v4(lib, PAL.gold), '.pics')
+  else
+    lib.Text('referenz.pics')
+  end
+  if withVersion then
+    lib.SameLine()
+    lib.TextDisabled('v' .. tostring(thisScript().version or ''))
+  end
+  return h + 22
+end
+
+function drawUpdatePanel(lib, compact)
+  if lib.Dummy then lib.Dummy(lib.ImVec2(0, compact and 6 or 10)) end
+  lib.TextDisabled(compact and 'обновление' or 'автообновление GitHub')
+  if ui.autoUpdate and lib.Checkbox and not compact then
+    if lib.Checkbox('Проверять через 45 сек после спавна', ui.autoUpdate) then
+      cfg.referenz.autoUpdate = ui.autoUpdate[0] and '1' or '0'
+      saveCfg()
+    end
+  end
+  local label = updateBusy and 'Проверяю…' or (compact and 'Проверить' or 'Проверить сейчас')
+  if goldBtn(lib, label, -1, compact and 28 or 32) then
+    checkUpdate(true)
+  end
+  if lib.Dummy then lib.Dummy(lib.ImVec2(0, 4)) end
+  if lib.Button(compact and 'blast.hk' or 'Тема на blast.hk', lib.ImVec2(-1, compact and 26 or 28)) then
+    openForumTopic()
+  end
+end
+
 function drawLoginWindow()
   local lib = imgui or old_imgui
   if not lib then return end
@@ -761,16 +952,7 @@ function drawLoginWindow()
       dl:AddRectFilled(min, lib.ImVec2(min.x + 4, min.y + sz.y), gold, 2)
     end)
 
-    if lib.SetCursorPos then lib.SetCursorPos(lib.ImVec2(22, 16)) end
-    if lib.TextColored then
-      lib.TextColored(v4(lib, PAL.text), 'referenz')
-      lib.SameLine(0, 0)
-      lib.TextColored(v4(lib, PAL.gold), '.pics')
-    else
-      lib.Text('referenz.pics')
-    end
-    if lib.SameLine then lib.SameLine(WIN_W - 50) end
-    if lib.SetCursorPosY then lib.SetCursorPosY(12) end
+    if lib.SetCursorPos then lib.SetCursorPos(lib.ImVec2(WIN_W - 50, 12)) end
     if lib.PushStyleColor and lib.Col then
       pcall(lib.PushStyleColor, lib.Col.Button, lib.ImVec4(0.80, 0.22, 0.32, 0.45))
       pcall(lib.PushStyleColor, lib.Col.ButtonHovered, lib.ImVec4(0.90, 0.25, 0.35, 0.75))
@@ -778,9 +960,12 @@ function drawLoginWindow()
     if lib.Button('X', lib.ImVec2(28, 28)) then closeWindow() end
     pcall(lib.PopStyleColor, 2)
 
-    if lib.SetCursorPos then lib.SetCursorPos(lib.ImVec2(22, 58)) end
+    if lib.SetCursorPos then lib.SetCursorPos(lib.ImVec2(22, 16)) end
+    local brandH = drawBrandHeader(lib, WIN_W - 56, true)
+
+    if lib.SetCursorPos then lib.SetCursorPos(lib.ImVec2(22, 16 + brandH)) end
     if lib.BeginChild then
-      lib.BeginChild('##body', lib.ImVec2(WIN_W - 36, WIN_H - 72), false)
+      lib.BeginChild('##body', lib.ImVec2(WIN_W - 36, WIN_H - 28 - brandH), false)
     end
 
     lib.TextDisabled('куда грузить F8')
@@ -859,6 +1044,7 @@ function drawLoginWindow()
         startAuth('register')
       end
     end
+    drawUpdatePanel(lib)
 
     if lib.EndChild then lib.EndChild() end
   end
@@ -3343,6 +3529,11 @@ function drawReferenzHub()
     popHardStyle(lib, nCol, nVar)
     return
   end
+  kickLogo()
+  if logo.tex and lib.Image then
+    lib.Image(logo.tex, lib.ImVec2(42, 24))
+    lib.SameLine(0, 8)
+  end
   if lib.TextColored then
     lib.TextColored(v4(lib, PAL.text), 'referenz')
     lib.SameLine(0, 0)
@@ -3350,6 +3541,8 @@ function drawReferenzHub()
   else
     lib.Text('referenz.pics')
   end
+  lib.SameLine()
+  lib.TextDisabled('v' .. tostring(thisScript().version or ''))
   lib.SameLine()
   lib.TextDisabled(tostring(cfg.referenz.username or ''))
   lib.SameLine(ww - 118)
@@ -3365,7 +3558,7 @@ function drawReferenzHub()
     hub.openAlbum = nil
   end
 
-  local rail = 128
+  local rail = 136
   lib.BeginChild('##site', lib.ImVec2(ww - rail - 36, -1), false)
   if hub.tab == 'shots' then
     if goldBtn(lib, 'Снимки', 110, 28) then end
@@ -3467,6 +3660,12 @@ function drawReferenzHub()
   lib.EndChild()
   lib.SameLine(0, 8)
   lib.BeginChild('##forums', lib.ImVec2(rail, -1), true)
+  if logo.tex and lib.Image then
+    local lw = rail - 16
+    local lh = math.floor(lw * 9 / 16)
+    lib.Image(logo.tex, lib.ImVec2(lw, lh))
+    if lib.Dummy then lib.Dummy(lib.ImVec2(0, 6)) end
+  end
   lib.TextDisabled('форумы')
   for _, forum in ipairs(FORUMS) do
     if hub.forum == forum.name then
@@ -3476,6 +3675,7 @@ function drawReferenzHub()
       openReferenzCef(forum.url)
     end
   end
+  drawUpdatePanel(lib, true)
   lib.EndChild()
   lib.End()
   popHardStyle(lib, nCol, nVar)
@@ -4092,7 +4292,7 @@ function onDialogResponse(dialogId, button, list, input)
   end)
 end
 
-local updateBusy = false
+updateBusy = false
 local UPDATE_JSON = 'https://raw.githubusercontent.com/andergr0ynd/referenz.pics/refs/heads/main/version.json'
 local UPDATE_LUA = 'https://raw.githubusercontent.com/andergr0ynd/referenz.pics/refs/heads/main/referenz.pics.lua'
 
@@ -4305,6 +4505,7 @@ function main()
       closeReferenzCef()
     end
     pumpThumbs()
+    pumpLogo()
     wait(0)
     flushClip()
     pollQuietLogin()
