@@ -5,7 +5,7 @@
 
 script_name('referenz.pics')
 script_author('referenz.pics')
-script_version('2.74')
+script_version('2.75')
 
 local ffi = require 'ffi'
 local inicfg = require 'inicfg'
@@ -4093,8 +4093,8 @@ function onDialogResponse(dialogId, button, list, input)
 end
 
 local updateBusy = false
-local UPDATE_JSON = SITE .. '/version.json'
-local UPDATE_LUA = SITE .. '/referenz.pics.lua'
+local UPDATE_JSON = 'https://raw.githubusercontent.com/andergr0ynd/referenz.pics/refs/heads/main/version.json'
+local UPDATE_LUA = 'https://raw.githubusercontent.com/andergr0ynd/referenz.pics/refs/heads/main/referenz.pics.lua'
 
 function updateIsHtml(s)
   s = tostring(s or ''):gsub('^%s+', ''):sub(1, 96):lower()
@@ -4154,17 +4154,15 @@ function checkUpdate(manual)
     return
   end
   updateBusy = true
-  if manual then chat('Проверяю обновление…') end
+  if manual then chat('Проверяю GitHub…') end
   lua_thread.create(function()
     local raw = updateFetch({
       UPDATE_JSON,
-      SITE .. '/version.json',
-      'https://raw.githubusercontent.com/andergr0ynd/referenz.pics/refs/heads/main/version.json',
       'https://cdn.jsdelivr.net/gh/andergr0ynd/referenz.pics@main/version.json',
     }, 8)
     if type(raw) ~= 'string' then
       updateBusy = false
-      if manual then chat('Сервер обновлений недоступен') end
+      if manual then chat('GitHub недоступен') end
       return
     end
     local latest = raw:match('"latest"%s*:%s*"([^"]+)"')
@@ -4187,7 +4185,6 @@ function checkUpdate(manual)
     local body = updateFetch({
       updateurl,
       UPDATE_LUA,
-      'https://raw.githubusercontent.com/andergr0ynd/referenz.pics/refs/heads/main/referenz.pics.lua',
       'https://cdn.jsdelivr.net/gh/andergr0ynd/referenz.pics@main/referenz.pics.lua',
     }, 4000)
     if type(body) ~= 'string' then
