@@ -5,7 +5,7 @@
 
 script_name('referenz.pics')
 script_author('referenz.pics')
-script_version('2.78')
+script_version('2.79')
 
 local ffi = require 'ffi'
 local inicfg = require 'inicfg'
@@ -52,6 +52,13 @@ pcall(function()
   end
 end)
 
+local thumbThread
+local hub -- Shared by auth callbacks defined before the hub UI.
+local authBusy = false
+local activeUpload = nil
+local httpJobs = {}
+local ownedShots = {}
+local shotSerial = 0
 local busy = false
 local hubWant = false
 local dropHub = false
@@ -59,8 +66,8 @@ local f8Wait = false
 local f8Clock = 0
 local needClose = false
 local authPending = { mode = '', user = '' }
-local DLG_USER = 87531
-local DLG_PASS = 87532
+local DLG_USER = 27531
+local DLG_PASS = 27532
 local WM_KEYDOWN = 0x0100
 local VK_F8 = 0x77
 
@@ -141,6 +148,11 @@ int DeleteObject(void*);
 int DeleteDC(void*);
 int GetDIBits(void*, void*, unsigned int, unsigned int, void*, BITMAPINFOHEADER*, unsigned int);
 void GetSystemTimeAsFileTime(FILETIME*);
+unsigned long long GetTickCount64(void);
+int MultiByteToWideChar(unsigned int, DWORD, const char*, int, unsigned short*, int);
+int MoveFileExW(const unsigned short*, const unsigned short*, DWORD);
+int IsIconic(void*);
+void GdiplusShutdown(void*);
 
 typedef struct {
   unsigned int GdiplusVersion;
@@ -169,6 +181,8 @@ HINTERNET WinHttpOpenRequest(HINTERNET, const unsigned short*, const unsigned sh
 int WinHttpSetOption(HINTERNET, DWORD, void*, DWORD);
 int WinHttpSendRequest(HINTERNET, const unsigned short*, DWORD, void*, DWORD, DWORD, DWORD);
 int WinHttpReceiveResponse(HINTERNET, void*);
+int WinHttpQueryHeaders(HINTERNET, DWORD, const unsigned short*, void*, DWORD*, DWORD*);
+int HttpQueryInfoA(HINTERNET, DWORD, void*, DWORD*, DWORD*);
 int WinHttpReadData(HINTERNET, void*, DWORD, DWORD*);
 int WinHttpCloseHandle(HINTERNET);
 ]]
@@ -230,13 +244,19 @@ end
 
 function wide(str)
   str = tostring(str or '')
-  local n = #str
-  local buf = ffi.new('unsigned short[?]', n + 1)
-  for i = 1, n do
-    buf[i - 1] = str:byte(i)
+  local cp, flags = 65001, 8 -- UTF-8, reject invalid bytes before falling back to Windows ANSI.
+  local n = kernel32.MultiByteToWideChar(cp, flags, str, #str, nil, 0)
+  if n == 0 and #str > 0 then
+    cp, flags = 0, 0
+    n = kernel32.MultiByteToWideChar(cp, flags, str, #str, nil, 0)
   end
-  buf[n] = 0
+  local buf = ffi.new('unsigned short[?]', n + 1)
+  if n > 0 then kernel32.MultiByteToWideChar(cp, flags, str, #str, buf, n) end
   return buf
+end
+
+function monotime()
+  return tonumber(kernel32.GetTickCount64()) / 1000
 end
 
 function lastErr()
@@ -282,10 +302,6 @@ function httpWinHttp(method, scheme, host, port, path, headers, body)
     winhttp.WinHttpCloseHandle(hOpen)
     return nil, 'request ' .. lastErr()
   end
-  if scheme == 'https' then
-    local sec = ffi.new('DWORD[1]', 0x00000100 + 0x00000200 + 0x00001000 + 0x00002000)
-    winhttp.WinHttpSetOption(hReq, 31, sec, 4)
-  end
   local blen = #body
   local payload = nil
   if blen > 0 then
@@ -314,21 +330,28 @@ function httpWinHttp(method, scheme, host, port, path, headers, body)
     winhttp.WinHttpCloseHandle(hOpen)
     return nil, 'recv ' .. tostring(err)
   end
-  local chunks = {}
+  local status = ffi.new('DWORD[1]')
+  local statusLen = ffi.new('DWORD[1]', 4)
+  winhttp.WinHttpQueryHeaders(hReq, 0x20000000 + 19, nil, status, statusLen, nil)
+  local chunks, size, readError = {}, 0, nil
   local buf = ffi.new('char[8192]')
   local read = ffi.new('DWORD[1]')
-  local pulls = 0
-  while winhttp.WinHttpReadData(hReq, buf, 8191, read) ~= 0 and read[0] > 0 do
-    chunks[#chunks + 1] = ffi.string(buf, read[0])
-    pulls = pulls + 1
-    if pulls % 4 == 0 and coroutine.running() then
-      wait(0)
+  while true do
+    if winhttp.WinHttpReadData(hReq, buf, 8192, read) == 0 then
+      readError = 'read ' .. lastErr()
+      break
     end
+    if read[0] == 0 then break end
+    size = size + tonumber(read[0])
+    if size > 20 * 1024 * 1024 then readError = 'response too large'; break end
+    chunks[#chunks + 1] = ffi.string(buf, read[0])
+    if #chunks % 4 == 0 and coroutine.running() then wait(0) end
   end
   winhttp.WinHttpCloseHandle(hReq)
   winhttp.WinHttpCloseHandle(hConn)
   winhttp.WinHttpCloseHandle(hOpen)
-  return table.concat(chunks)
+  if readError then return nil, readError, tonumber(status[0]) end
+  return table.concat(chunks), nil, tonumber(status[0])
 end
 
 function httpWininet(method, scheme, host, port, path, headers, body)
@@ -353,10 +376,6 @@ function httpWininet(method, scheme, host, port, path, headers, body)
     wininet.InternetCloseHandle(hOpen)
     return nil, 'HttpOpenRequest ' .. lastErr()
   end
-  if scheme == 'https' then
-    local sec = ffi.new('DWORD[1]', 0x00000100 + 0x00000200 + 0x00001000 + 0x00002000)
-    wininet.InternetSetOptionA(hReq, 31, sec, 4)
-  end
   local blen = #body
   local payload = nil
   if blen > 0 then
@@ -365,11 +384,18 @@ function httpWininet(method, scheme, host, port, path, headers, body)
   end
   local hdr = headers ~= '' and (headers .. '\r\n') or ''
   local ok = wininet.HttpSendRequestA(hReq, hdr, #hdr, payload, blen)
-  local chunks = {}
+  local status = ffi.new('DWORD[1]')
+  local statusLen = ffi.new('DWORD[1]', 4)
+  if ok ~= 0 then wininet.HttpQueryInfoA(hReq, 0x20000000 + 19, status, statusLen, nil) end
+  local chunks, size, readError = {}, 0, nil
   if ok ~= 0 then
     local buf = ffi.new('char[4096]')
     local read = ffi.new('DWORD[1]')
-    while wininet.InternetReadFile(hReq, buf, 4095, read) ~= 0 and read[0] > 0 do
+    while true do
+      if wininet.InternetReadFile(hReq, buf, 4096, read) == 0 then readError = 'read ' .. lastErr(); break end
+      if read[0] == 0 then break end
+      size = size + tonumber(read[0])
+      if size > 20 * 1024 * 1024 then readError = 'response too large'; break end
       chunks[#chunks + 1] = ffi.string(buf, read[0])
     end
   end
@@ -378,30 +404,52 @@ function httpWininet(method, scheme, host, port, path, headers, body)
   wininet.InternetCloseHandle(hConn)
   wininet.InternetCloseHandle(hOpen)
   if ok == 0 then return nil, 'HttpSendRequest ' .. tostring(err) end
-  return table.concat(chunks)
+  if readError then return nil, readError, tonumber(status[0]) end
+  return table.concat(chunks), nil, tonumber(status[0])
 end
 
 function httpPost(url, headers, body)
+  local handled, response, err, code = httpAsync('POST', url, headers, body)
+  if handled then return response, err, code end
   local scheme, host, port, path = parseUrl(url)
   if not host then return nil, 'bad url' end
-  local resp, err = httpWinHttp('POST', scheme, host, port, path, headers, body)
-  if resp and resp ~= '' then return resp end
+  -- A failed POST may already have been processed. Retrying it can create duplicates.
+  if winhttp then return httpWinHttp('POST', scheme, host, port, path, headers, body) end
   return httpWininet('POST', scheme, host, port, path, headers, body)
 end
 
 function httpGet(url, headers)
+  local handled, response, err, code = httpAsync('GET', url, headers, '')
+  if handled then return response, err, code end
   local scheme, host, port, path = parseUrl(url)
   if not host then return nil, 'bad url' end
   if winhttp then
-    return httpWinHttp('GET', scheme, host, port, path, headers, '')
+    local body, err, status = httpWinHttp('GET', scheme, host, port, path, headers, '')
+    if body ~= nil then return body, err, status end
   end
   return httpWininet('GET', scheme, host, port, path, headers, '')
 end
 
 function jsonEscape(s)
-  s = tostring(s or '')
-  s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\r', '\\r'):gsub('\n', '\\n')
-  return s
+  local escapes = { ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+  return (tostring(s or ''):gsub('[%z\1-\31\\"]', function(c)
+    return escapes[c] or string.format('\\u%04x', c:byte())
+  end))
+end
+
+function parseJson(text)
+  if type(text) ~= 'string' or text == '' then return nil end
+  if type(decodeJson) == 'function' then
+    local ok, data = pcall(decodeJson, text)
+    if ok and type(data) == 'table' then return data end
+    return nil
+  end
+  local ok, json = pcall(require, 'dkjson')
+  if ok and type(json) == 'table' and type(json.decode) == 'function' then
+    local parsed, data = pcall(json.decode, text)
+    if parsed and type(data) == 'table' then return data end
+  end
+  return nil
 end
 
 function setBuf(buf, str, cap)
@@ -511,6 +559,7 @@ function closeWindow()
 end
 
 function windowOpen()
+  if authPending.dialog then return true end
   if ui.ready == 'mimgui' and ui.show then
     return ui.show[0] and true or false
   end
@@ -518,37 +567,23 @@ function windowOpen()
 end
 
 function finishAuth(resp, kind, username, password, quiet)
-  if not resp or resp == '' then
-    ui.msg = 'Нет связи с сайтом'
-    return false
-  end
-  local errorText = resp:match('"error"%s*:%s*"(.-)"')
-  if errorText then
-    ui.msg = errorText
-    return false
-  end
-  local tok = resp:match('"apiToken"%s*:%s*"([%w]+)"')
-  if not tok then
-    ui.msg = 'Не удалось войти'
-    return false
-  end
-  cfg.referenz.username = username
+  local data = parseJson(resp)
+  if not data then ui.msg = resp and 'Некорректный ответ сайта' or 'Нет связи с сайтом'; return false end
+  if type(data.error) == 'string' then ui.msg = data.error; return false end
+  local tok = data.apiToken
+  if type(tok) ~= 'string' or not tok:match('^%w+$') then ui.msg = 'Не удалось войти'; return false end
+  local account = type(data.user) == 'table' and data.user or data
+  cfg.referenz.username = type(account.username) == 'string' and account.username or username
   cfg.referenz.password = password
   cfg.referenz.token = tok
-  local host = resp:match('"uploadHost"%s*:%s*"(%w+)"')
-  local key = resp:match('"imgbbKey"%s*:%s*"([^"]*)"')
-  if host == 'imgbb' or host == 'referenz' then
-    cfg.referenz.host = host
-  end
-  if key and key ~= '' then
-    cfg.referenz.imgbb = key
-  end
+  if account.uploadHost == 'imgbb' or account.uploadHost == 'referenz' then cfg.referenz.host = account.uploadHost end
+  if type(account.imgbbKey) == 'string' then cfg.referenz.imgbb = account.imgbbKey end
   saveCfg()
   fillAuthFields()
-  ui.msg = kind == 'register' and 'Аккаунт создан' or ('Вход: ' .. username)
+  ui.msg = kind == 'register' and 'Аккаунт создан' or ('Вход: ' .. cfg.referenz.username)
   closeWindow()
   if not quiet then
-    chat(kind == 'register' and 'Аккаунт создан' or ('Вход: ' .. username))
+    chat(ui.msg)
     hubWant = true
   end
   return true
@@ -563,7 +598,9 @@ function doAuth(kind, username, password, quiet)
   end
   local payload = '{"username":"' .. jsonEscape(username) .. '","password":"' .. jsonEscape(password) .. '"}'
   local path = kind == 'register' and '/api/register' or '/api/login'
+  local gen = hub.loginGen or 0
   local resp, err = httpPost(SITE .. path, 'Content-Type: application/json', payload)
+  if gen ~= (hub.loginGen or 0) then return false end
   if not resp then
     ui.msg = 'Нет связи с сайтом' .. (err and (' (' .. err .. ')') or '')
     return false
@@ -571,11 +608,22 @@ function doAuth(kind, username, password, quiet)
   return finishAuth(resp, kind, username, password, quiet)
 end
 
+function submitAuth(kind, user, pass)
+  if authBusy then return end
+  authBusy = true
+  hub.loginGen = (hub.loginGen or 0) + 1
+  if loginJob then pcall(function() loginJob.th:cancel(0) end); loginJob = nil end
+  local gen = hub.loginGen or 0
+  lua_thread.create(function()
+    local ok = pcall(doAuth, kind, user, pass)
+    if gen == (hub.loginGen or 0) then authBusy = false end
+    if not ok and gen == (hub.loginGen or 0) then ui.msg = 'Не удалось выполнить вход' end
+  end)
+end
+
 function startAuth(kind)
   local user, pass = readAuthFields()
-  lua_thread.create(function()
-    doAuth(kind, user, pass)
-  end)
+  submitAuth(kind, user, pass)
 end
 
 function openLoginWindow()
@@ -592,10 +640,14 @@ function openLoginWindow()
   end
   authPending.mode = 'login'
   authPending.user = ''
-  sampShowDialog(DLG_USER, 1, ru('referenz.pics'), ru('Введите логин'), ru('Далее'), ru('Отмена'))
+  authPending.dialog = DLG_USER
+  sampShowDialog(DLG_USER, ru('referenz.pics'), ru('Введите логин'), ru('Далее'), ru('Отмена'), 1)
 end
 
 function doLogout()
+  if thumbThread then pcall(function() thumbThread.th:cancel(0) end); thumbThread = nil end
+  if loginJob then pcall(function() loginJob.th:cancel(0) end) end
+  authBusy = false
   cfg.referenz.username = ''
   cfg.referenz.password = ''
   cfg.referenz.token = ''
@@ -604,6 +656,12 @@ function doLogout()
   ui.msg = ''
   hub.loginGen = (hub.loginGen or 0) + 1
   loginJob = nil
+  hub.shots, hub.albums, hub.sideShots, hub.albumShots = {}, {}, {}, {}
+  hub.raw, hub.miss, hub.tex, hub.mem = {}, {}, {}, {}
+  hub.pendingId = nil
+  texFlag[0] = 0
+  hub.pick, hub.openAlbum, hub.sideAlbum = nil, nil, nil
+  hub.loading, hub.albumBusy = false, false
   dropHub = true
   hub.openLogin = true
   chat('Вы вышли')
@@ -808,7 +866,7 @@ function fetchLogo()
   if type(downloadUrlToFile) == 'function' then
     local ml = require('moonloader')
     local ds = ml and ml.download_status
-    logo.job = { done = false, ok = false, t0 = os.clock(), url = 1 }
+    logo.job = { done = false, ok = false, t0 = monotime(), url = 1 }
     local job = logo.job
     local urls = { LOGO_URL, LOGO_URL_CDN }
     pcall(downloadUrlToFile, urls[1] .. '?t=' .. tostring(os.time()), part, function(_, status)
@@ -851,7 +909,7 @@ function pumpLogo()
     end
     return
   end
-  if os.clock() - (job.t0 or 0) > 25 then
+  if monotime() - (job.t0 or 0) > 25 then
     logo.job = nil
     pcall(os.remove, LOGO_PATH .. '.part')
     logo.busy = false
@@ -1074,7 +1132,7 @@ local typingOn = false
 local barMouse = false
 local altWas = false
 local cefCommitW, cefCommitH = CEF_W, CEF_H
-local hub = {
+hub = {
   tab = 'shots',
   shots = {},
   albums = {},
@@ -2130,7 +2188,7 @@ function azStartSetup()
   kernel32.CreateDirectoryA(AZ_DIR, nil)
   az.status = 'setup'
   az.err = ''
-  az.setup_at = os.clock()
+  az.setup_at = monotime()
   azWrite(AZ_DIR .. '\\setup.ps1', blobs.setup)
   os.remove(AZ_DIR .. '\\setup_status.txt')
   local cmd = string.format('"%s" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%s\\setup.ps1" "%s"', azPsPath(), AZ_DIR, AZ_DIR)
@@ -2163,33 +2221,33 @@ function azStartHelper()
   if not az.pid then return azFail('не удалось запустить PowerShell') end
   az.status = 'starting'
   az.err = ''
-  az.started_at = os.clock()
-  az.tick_t = os.clock()
+  az.started_at = monotime()
+  az.tick_t = monotime()
 end
 
 function azEnsure()
-  if az.status ~= 'idle' or os.clock() < az.hold then return end
+  if az.status ~= 'idle' or monotime() < az.hold then return end
   if azFilesOk() then azStartHelper() else azStartSetup() end
 end
 
 function azRestart()
   if az.cmd then azSend('quit') end
   if az.old_proc ~= nil then azCloseProc(az.old_proc, true) end
-  az.old_proc, az.old_kill = az.hproc, os.clock() + 3
+  az.old_proc, az.old_kill = az.hproc, monotime() + 3
   az.hproc = nil
   az.status = 'idle'
   az.shown = false
-  az.pending, az.hold = true, os.clock() + 1.2
+  az.pending, az.hold = true, monotime() + 1.2
   az.tries = 1
   az.gave_up = false
 end
 
 function azPollState()
-  if az.old_proc ~= nil and os.clock() >= az.old_kill then
+  if az.old_proc ~= nil and monotime() >= az.old_kill then
     azCloseProc(az.old_proc, true)
     az.old_proc = nil
   end
-  if az.pending and az.status == 'idle' and os.clock() >= az.hold then
+  if az.pending and az.status == 'idle' and monotime() >= az.hold then
     az.pending = false
     azEnsure()
   end
@@ -2199,7 +2257,7 @@ function azPollState()
       if azFilesOk() then azStartHelper() else azFail('компоненты не найдены после загрузки') end
     elseif s and s:find('^error') then
       azFail('загрузка компонентов: ' .. s:gsub('^error%s*', ''))
-    elseif os.clock() - az.setup_at > 180 then
+    elseif monotime() - az.setup_at > 180 then
       azFail('загрузка компонентов заняла слишком много времени')
     end
     return
@@ -2207,7 +2265,7 @@ function azPollState()
   if az.status ~= 'starting' and az.status ~= 'ready' then return end
   local s = azRead(az.state)
   if not s then
-    if az.status == 'starting' and os.clock() - az.started_at > 60 then azFail('помощник не запустился') end
+    if az.status == 'starting' and monotime() - az.started_at > 60 then azFail('помощник не запустился') end
     return
   end
   local st = azParseState(s)
@@ -2216,12 +2274,12 @@ function azPollState()
     azLog('recover: ' .. tostring(st.recover))
     azKillHelper()
     az.status = 'idle'
-    az.pending, az.hold = true, os.clock() + 1.2
+    az.pending, az.hold = true, monotime() + 1.2
     return
   end
   if st.tick and st.tick ~= az.tick then
     az.tick = st.tick
-    az.tick_t = os.clock()
+    az.tick_t = monotime()
   end
   if st.ready == '1' and az.status ~= 'ready' then az.status = 'ready' end
   if st.loaded == '1' and not az.loaded then az.loaded = true end
@@ -2231,7 +2289,7 @@ function azPollState()
     az.ready_nav = true
     azSend('nav ' .. az.want_url)
   end
-  if os.clock() - az.tick_t > 12 and az.status == 'ready' then
+  if monotime() - az.tick_t > 12 and az.status == 'ready' then
     azLog('браузер не отвечает, перезапуск')
     azRestart()
   end
@@ -2266,7 +2324,7 @@ function azFeedWeb(px, py, sw, sh, hov)
       az.cap[b] = true
       az.kb = true
       az.web_hit = true
-      local t, c = os.clock(), az.clk
+      local t, c = monotime(), az.clk
       if c and c.b == b and t - c.t < 0.4 and math.abs(bx - c.x) < 6 and math.abs(by - c.y) < 6 then
         c.n = math.min(c.n + 1, 3)
       else
@@ -2355,15 +2413,11 @@ end
 
 function clampSize(w, h)
   local sw, sh = getScreenResolution()
-  w = math.floor(w)
-  h = math.floor(h)
-  local maxW = math.min(CEF_MAX_W, math.max(CEF_MIN_W, sw - 8))
-  local maxH = math.min(CEF_MAX_H, math.max(CEF_MIN_H, sh - 40))
-  if w < CEF_MIN_W then w = CEF_MIN_W end
-  if h < CEF_MIN_H then h = CEF_MIN_H end
-  if w > maxW then w = maxW end
-  if h > maxH then h = maxH end
-  return w, h
+  local maxW = math.max(1, math.min(CEF_MAX_W, sw - 8))
+  local maxH = math.max(1, math.min(CEF_MAX_H, sh - 40))
+  w = math.floor(tonumber(w) or CEF_W)
+  h = math.floor(tonumber(h) or CEF_H)
+  return math.max(math.min(CEF_MIN_W, maxW), math.min(w, maxW)), math.max(math.min(CEF_MIN_H, maxH), math.min(h, maxH))
 end
 
 function savedBrowserSize()
@@ -2480,7 +2534,7 @@ end
 function pumpBrowse()
   if az.pumping then return end
   az.pumping = true
-  local now = os.clock()
+  local now = monotime()
   if now - (az.poll_at or 0) >= 0.3 then
     az.poll_at = now
     local ok, err = pcall(azPollState)
@@ -2503,46 +2557,80 @@ function absSite(url)
 end
 
 function parseShots(body)
+  local data = parseJson(body)
+  if not data then return {} end
+  local rows = data.items or data.photos or data
   local list = {}
-  local i = 1
-  body = tostring(body)
-  while #list < 24 do
-    local a, b, id, url = body:find('"id"%s*:%s*"(%w+)"%s*,%s*"url"%s*:%s*"([^"]+)"', i)
-    if not a then break end
-    local window = body:sub(b, b + 700)
-    list[#list + 1] = {
-      id = id,
-      url = absSite(url),
-      review = window:find('"review"%s*:%s*true') ~= nil,
-    }
-    i = b + 1
+  if type(rows) ~= 'table' then return list end
+  for _, row in ipairs(rows) do
+    if type(row) == 'table' and type(row.id) == 'string' and row.id:match('^[%w_-]+$') and type(row.url) == 'string' then
+      list[#list + 1] = { id = row.id, url = absSite(row.url), review = row.review == true, kind = row.kind }
+      if #list >= 24 then break end
+    end
   end
   return list
 end
 
 function parseAlbums(body)
+  local data = parseJson(body)
+  if not data then return {} end
+  local rows = data.items or data.albums or data
   local list = {}
-  local i = 1
-  body = tostring(body)
-  while #list < 24 do
-    local a, b, id = body:find('"id"%s*:%s*"(%w+)"', i)
-    if not a then break end
-    local window = body:sub(b, b + 800)
-    local title = window:match('"title"%s*:%s*"([^"]*)"')
-    local count = window:match('"count"%s*:%s*(%d+)')
-    local vis = window:match('"visibility"%s*:%s*"(%w+)"') or 'private'
-    if title and title ~= '' then
-      list[#list + 1] = { id = id, title = title, count = count or '0', vis = vis }
+  if type(rows) ~= 'table' then return list end
+  for _, row in ipairs(rows) do
+    if type(row) == 'table' and type(row.id) == 'string' and row.id:match('^%w+$') and type(row.title) == 'string' then
+      list[#list + 1] = { id = row.id, title = row.title, count = tostring(row.count or 0), vis = row.visibility or 'private', desc = row.description or '' }
+      if #list >= 24 then break end
     end
-    i = b + 1
   end
   return list
 end
 
-local thumbThread = nil
+thumbThread = nil
 local effilLib = nil
 local shrinkShot
 pcall(function() effilLib = require('effil') end)
+
+function httpAsync(method, url, headers, body)
+  if not effilLib or not coroutine.running() then return false end
+  local okStart, runner = pcall(function()
+    return effilLib.thread(function(method, url, rawHeaders, body)
+      local okReq, requests = pcall(require, 'requests')
+      if not okReq or not requests then return false, 'no requests' end
+      local fields = {}
+      for line in tostring(rawHeaders or ''):gmatch('[^\r\n]+') do
+        local key, value = line:match('^([^:]+):%s*(.*)$')
+        if key then fields[key] = value end
+      end
+      local options = { headers = fields, timeout = 20 }
+      if method ~= 'GET' then options.data = body or '' end
+      local ok, response = pcall(method == 'GET' and requests.get or requests.post, url, options)
+      if not ok or not response or type(response.text) ~= 'string' then return false, 'request failed' end
+      return true, response.text, tonumber(response.status_code)
+    end)(method, url, headers or '', body or '')
+  end)
+  if not okStart or not runner then return false end
+  httpJobs[runner] = true
+  local deadline = monotime() + 30
+  while monotime() < deadline do
+    local okStatus, status, err = pcall(function() return runner:status() end)
+    if not okStatus or err or status == 'failed' or status == 'cancelled' or status == 'canceled' then
+      httpJobs[runner] = nil
+      return true, nil, 'request worker failed'
+    end
+    if status == 'completed' then
+      httpJobs[runner] = nil
+      local ok, success, response, code = pcall(function() return runner:get(0) end)
+      if ok and not success and response == 'no requests' then return false end
+      if not ok or not success then return true, nil, 'request failed' end
+      return true, response, nil, code
+    end
+    wait(0)
+  end
+  pcall(function() runner:cancel(0) end)
+  httpJobs[runner] = nil
+  return true, nil, 'request timeout'
+end
 
 function looksImage(bin)
   if type(bin) ~= 'string' or #bin < 32 then return false end
@@ -2615,11 +2703,17 @@ end
 function takeThumb()
   if not ui.hub or not ui.hub[0] then return end
   if thumbThread then
+    if monotime() >= thumbThread.deadline then
+      pcall(function() thumbThread.th:cancel(0) end)
+      thumbThread.item.miss = true
+      thumbThread = nil
+      return
+    end
     local st, err = nil, nil
     pcall(function()
       st, err = thumbThread.th:status()
     end)
-    if err or st == 'failed' or st == 'canceled' then
+    if err or st == 'failed' or (st == 'canceled' or st == 'cancelled') then
       thumbThread.item.miss = true
       thumbThread = nil
       return
@@ -2635,6 +2729,7 @@ function takeThumb()
       if f then
         bin = f:read('*a')
         f:close()
+        pcall(os.remove, info)
       end
     end
     finishThumb(thumbThread.item, thumbThread.id, bin)
@@ -2671,7 +2766,8 @@ function takeThumb()
     item.miss = true
     return
   end
-  local url, token, id = item.url, item.pub and '' or tostring(cfg.referenz.token or ''), item.id
+  local url, id = item.url, item.id
+  local token = not item.pub and url:sub(1, #SITE + 1) == SITE .. '/' and tostring(cfg.referenz.token or '') or ''
   local dir = getWorkingDirectory() .. '\\referenz-cache'
   pcall(function() kernel32.CreateDirectoryA(dir, nil) end)
   local path = dir .. '\\' .. id .. '.bin'
@@ -2683,7 +2779,7 @@ function takeThumb()
         headers = photoToken ~= '' and { ['Authorization'] = 'Bearer ' .. photoToken } or {},
         timeout = 30,
       })
-      if not okHttp or not resp or type(resp.text) ~= 'string' or #resp.text < 32 then
+      if not okHttp or not resp or tonumber(resp.status_code) ~= 200 or type(resp.text) ~= 'string' or #resp.text < 32 then
         return false, 'empty'
       end
       local f = io.open(photoPath, 'wb')
@@ -2697,7 +2793,7 @@ function takeThumb()
     item.miss = true
     return
   end
-  thumbThread = { th = th, item = item, id = id }
+  thumbThread = { th = th, item = item, id = id, deadline = monotime() + 40 }
 end
 
 function addShots(body)
@@ -2705,7 +2801,7 @@ function addShots(body)
   for _, shot in ipairs(hub.shots) do seen[shot.id] = true end
   for _, shot in ipairs(parseShots(body or '')) do
     local url = shot.url:lower()
-    if not seen[shot.id] and #hub.shots < 18 and not url:find('%.mp4', 1, true) and not url:find('%.webm', 1, true) then
+    if not seen[shot.id] and #hub.shots < 18 and shot.kind ~= 'video' and not url:match('%.mp4[%?#]?') and not url:match('%.webm[%?#]?') then
       hub.shots[#hub.shots + 1] = shot
       seen[shot.id] = true
     end
@@ -2734,13 +2830,16 @@ function loadHub()
   if not useImgbb() then hub.note = '' end
   lua_thread.create(function()
     wait(0)
+    local gen, token = hub.loginGen or 0, cfg.referenz.token
     local hdr = authHead()
     local shots = httpGet(SITE .. '/api/inbox', hdr)
     wait(0)
     local albums = httpGet(SITE .. '/api/albums?user=' .. tostring(cfg.referenz.username), hdr)
-    if not shots then
+    if gen ~= (hub.loginGen or 0) or token ~= cfg.referenz.token then return end
+    if useImgbb() then hub.loading = false; return end
+    if not shots or readErr(shots) then
       if not useImgbb() then
-        hub.note = 'Нет связи с сайтом'
+        hub.note = readErr(shots) or 'Нет связи с сайтом'
         hub.shots = {}
       end
       hub.albums = {}
@@ -2752,7 +2851,9 @@ function loadHub()
         for i, album in ipairs(hub.albums) do
           if #hub.shots >= 12 or i > 4 then break end
           wait(0)
-          addShots(httpGet(SITE .. '/api/albums/' .. album.id, hdr) or '')
+          local body = httpGet(SITE .. '/api/albums/' .. album.id, hdr) or ''
+          if gen ~= (hub.loginGen or 0) or token ~= cfg.referenz.token then return end
+          addShots(body)
         end
         if #hub.shots == 0 and #hub.albums == 0 then
           hub.note = 'Пока пусто'
@@ -2842,10 +2943,12 @@ function writeClipboard(text)
       kernel32.GlobalFree(hmem)
       return nil
     end
+    ffi.fill(ptr, bytes)
     return hmem, ptr
   end
   local ansi, ansiPtr = alloc(#text + 1)
-  local wideMem, widePtr = alloc((#text + 1) * 2)
+  local unicode = wide(text)
+  local wideMem, widePtr = alloc(ffi.sizeof(unicode))
   if ansi == nil or wideMem == nil then
     if ansi ~= nil then
       kernel32.GlobalUnlock(ansi)
@@ -2859,11 +2962,7 @@ function writeClipboard(text)
   end
   ffi.copy(ansiPtr, text)
   kernel32.GlobalUnlock(ansi)
-  local wide = ffi.cast('unsigned short*', widePtr)
-  for i = 1, #text do
-    wide[i - 1] = text:byte(i)
-  end
-  wide[#text] = 0
+  ffi.copy(widePtr, unicode, ffi.sizeof(unicode))
   kernel32.GlobalUnlock(wideMem)
   if user32.OpenClipboard(nil) == 0 then
     kernel32.GlobalFree(ansi)
@@ -2911,9 +3010,13 @@ end
 
 function readErr(body)
   if not body or body == '' then return 'Нет связи с сайтом' end
-  local err = body:match('"error"%s*:%s*"(.-)"')
-  if not err then return nil end
-  return (err:gsub('\\/', '/'))
+  local data = parseJson(body)
+  if not data then return 'Некорректный ответ сайта' end
+  if type(data.error) == 'string' then return data.error end
+  if data.error ~= nil or data.success == false then
+    return type(data.error) == 'table' and type(data.error.message) == 'string' and data.error.message or 'Ошибка сервера'
+  end
+  return nil
 end
 
 function visName(vis)
@@ -2927,7 +3030,7 @@ function shotsFrom(body, cap)
   cap = cap or 24
   for _, shot in ipairs(parseShots(body or '')) do
     local url = shot.url:lower()
-    if #list < cap and not url:find('%.mp4', 1, true) and not url:find('%.webm', 1, true) then
+    if #list < cap and shot.kind ~= 'video' and not url:match('%.mp4[%?#]?') and not url:match('%.webm[%?#]?') then
       list[#list + 1] = shot
     end
   end
@@ -2962,9 +3065,8 @@ function openAlbum(album)
       hub.albumMsg = err
       return
     end
-    local vis = body:match('"visibility"%s*:%s*"(%w+)"')
-    local title = body:match('"title"%s*:%s*"([^"]*)"')
-    local desc = body:match('"description"%s*:%s*"([^"]*)"')
+    local info = parseJson(body) or {}
+    local vis, title, desc = info.visibility, info.title, info.description
     if vis then hub.openAlbum.vis = vis end
     if title and title ~= '' then hub.openAlbum.title = title end
     hub.openAlbum.desc = desc or ''
@@ -3015,7 +3117,8 @@ function createAlbum()
       hub.albumMsg = err
       return
     end
-    local id = tostring(body or ''):match('"id"%s*:%s*"(%w+)"')
+    local info = parseJson(body) or {}
+    local id = type(info.id) == 'string' and info.id or nil
     if ui.albumTitle then setBuf(ui.albumTitle, '', 81) end
     if ui.albumDesc then setBuf(ui.albumDesc, '', 281) end
     chat('Альбом создан')
@@ -3785,7 +3888,7 @@ function listDir(dir, files, depth)
   if depth > 2 then return end
   local data = ffi.new('WIN32_FIND_DATAA')
   local handle = kernel32.FindFirstFileA(dir .. '\\*', data)
-  if handle == nil or handle == INVALID_HANDLE then return end
+  if handle == nil or handle == ffi.cast('void*', -1) then return end
   repeat
     local name = ffi.string(data.cFileName)
     if name ~= '.' and name ~= '..' then
@@ -3822,25 +3925,32 @@ function findChanged(before)
   local best, bestStamp = nil, 0
   for path, info in pairs(now) do
     local old = before[path]
-    if (not old or old.size ~= info.size) and info.stamp >= bestStamp then
+    if (not old or old.size ~= info.size or old.stamp ~= info.stamp) and info.stamp >= bestStamp then
       best, bestStamp = path, info.stamp
     end
   end
   return best
 end
 
+function newShotPath(ext)
+  shotSerial = shotSerial + 1
+  return getWorkingDirectory() .. '\\referenz_up_' .. tostring(os.time()) .. '_' .. shotSerial .. (ext or '.jpg')
+end
+
+
 function copyShot(src)
   local ext = src:match('(%.[^\\/%.]+)$') or '.png'
-  local dst = getWorkingDirectory() .. '\\referenz_up' .. ext
+  local dst = newShotPath(ext)
   local inf = io.open(src, 'rb')
   if not inf then return nil, ext end
   local data = inf:read('*a')
   inf:close()
-  if not data or #data < 8000 then return nil, ext end
+  if not data or #data < 32 then return nil, ext end
   local out = io.open(dst, 'wb')
   if not out then return nil, ext end
   out:write(data)
   out:close()
+  ownedShots[dst] = true
   return dst, ext
 end
 
@@ -3857,36 +3967,35 @@ end
 
 function takeGdiShot()
   local ok, path = pcall(function()
-    local hwnd = user32.GetForegroundWindow()
-    if hwnd == nil then
-      hwnd = user32.FindWindowA('Grand theft auto San Andreas', nil)
-    end
-    if hwnd == nil then return nil end
+    local hwnd = azGameHwnd()
+    if hwnd == nil or user32.GetForegroundWindow() ~= hwnd or user32.IsIconic(hwnd) ~= 0 then return nil end
     local rc = ffi.new('RECT')
     if user32.GetClientRect(hwnd, rc) == 0 then return nil end
-    local w = tonumber(rc.right - rc.left) or 0
-    local h = tonumber(rc.bottom - rc.top) or 0
-    if w < 64 or h < 64 or w > 4096 or h > 4096 then return nil end
+    local w, h = tonumber(rc.right - rc.left), tonumber(rc.bottom - rc.top)
+    if w < 64 or h < 64 or w > 8192 or h > 8192 then return nil end
     local hdc = user32.GetDC(hwnd)
     if hdc == nil then return nil end
     local mem = gdi32.CreateCompatibleDC(hdc)
+    if mem == nil then user32.ReleaseDC(hwnd, hdc); return nil end
     local bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+    if bmp == nil then gdi32.DeleteDC(mem); user32.ReleaseDC(hwnd, hdc); return nil end
     local old = gdi32.SelectObject(mem, bmp)
-    gdi32.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020)
-    gdi32.SelectObject(mem, old)
+    local copied = gdi32.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020) ~= 0
+    if old ~= nil then gdi32.SelectObject(mem, old) end
     local dest = nil
-    if gdiplus then
+    if copied and gdiplus then
       local image = ffi.new('void*[1]')
       if gdiplus.GdipCreateBitmapFromHBITMAP(bmp, nil, image) == 0 and image[0] ~= nil then
-        dest = getWorkingDirectory() .. '\\referenz_up.jpg'
+        dest = newShotPath('.jpg')
         local status = gdiplus.GdipSaveImageToFile(image[0], wide(dest), jpegClsid, nil)
         gdiplus.GdipDisposeImage(image[0])
-        if status ~= 0 then dest = nil end
+        if status ~= 0 then pcall(os.remove, dest); dest = nil end
       end
     end
     gdi32.DeleteObject(bmp)
     gdi32.DeleteDC(mem)
     user32.ReleaseDC(hwnd, hdc)
+    if dest then ownedShots[dest] = true end
     return dest
   end)
   if ok and path then return path, '.jpg' end
@@ -3898,19 +4007,13 @@ function unescapeUrl(s)
 end
 
 function pickUrl(resp)
-  resp = tostring(resp or '')
-  local url = resp:match('"direct_url"%s*:%s*"(.-)"')
-    or resp:match('"display_url"%s*:%s*"(.-)"')
-    or resp:match('"shareUrl"%s*:%s*"(.-)"')
-    or resp:match('"album_url"%s*:%s*"(.-)"')
-    or resp:match('"url"%s*:%s*"(https?://[^"]+)"')
-  url = unescapeUrl(url)
-  if url:find('ibb.co', 1, true) or url:find('imgbb', 1, true) then
-    return url
-  end
-  if url:find('^https?://') and resp:match('"host"%s*:%s*"(%w+)"') then
-    return url
-  end
+  local data = parseJson(resp)
+  if not data then return nil end
+  local item = type(data.data) == 'table' and data.data or data
+  local url = item.direct_url or item.display_url or item.url
+  if type(url) ~= 'string' or not url:find('^https?://') then return nil end
+  local _, host = parseUrl(url)
+  if host == 'ibb.co' or host == 'i.ibb.co' or host == 'imgbb.com' or item.host == 'imgbb' then return url end
   return nil
 end
 
@@ -3941,16 +4044,13 @@ function readImgbbShots()
 end
 
 function rememberImgbb(resp)
-  resp = tostring(resp or '')
-  local direct = unescapeUrl(resp:match('"display_url"%s*:%s*"(https?://[^"]+)"') or '')
-  if direct == '' then
-    direct = unescapeUrl(resp:match('"url"%s*:%s*"(https?://i%.ibb%.co[^"]+)"') or '')
-  end
-  if direct == '' then direct = pickUrl(resp) or '' end
-  if direct == '' then return end
-  local viewer = unescapeUrl(resp:match('"url_viewer"%s*:%s*"(https?://[^"]+)"') or '')
-  if viewer == '' then viewer = direct end
-  local id = resp:match('"id"%s*:%s*"([^"]+)"') or direct:match('/([^/%?]+)%.%w+$') or tostring(os.time())
+  local data = parseJson(resp)
+  if not data then return end
+  local item = type(data.data) == 'table' and data.data or data
+  local direct = item.display_url or item.direct_url or item.url or pickUrl(resp)
+  if type(direct) ~= 'string' or not direct:find('^https?://') then return end
+  local viewer = item.url_viewer or direct
+  local id = tostring(item.id or direct:match('/([^/%?]+)%.%w+$') or os.time())
   id = id:gsub('[^%w%-_]', '')
   if id == '' then return end
   local rows = { id .. '\t' .. viewer .. '\t' .. direct }
@@ -3980,37 +4080,17 @@ function copyUrl(url)
 end
 
 function handleUploadResp(resp, err)
-  if not resp then
-    chat('Нет связи с сайтом' .. (err and (' (' .. err .. ')') or ''))
-    return false
-  end
-  local errorText = resp:match('"error"%s*:%s*"(.-)"')
-  if not errorText then
-    errorText = resp:match('"message"%s*:%s*"(.-)"')
-    if errorText and not resp:match('"success"%s*:%s*true') then
-      -- keep
-    else
-      errorText = nil
-    end
-  end
-  if errorText then
-    chat(errorText)
+  if not resp then chat('Нет связи с сайтом' .. (err and (' (' .. err .. ')') or '')); return false end
+  local data = parseJson(resp)
+  if not data then chat('Некорректный ответ сервера'); return false end
+  if data.error or data.success == false then
+    local errorText = type(data.error) == 'table' and data.error.message or data.error
+    chat(type(errorText) == 'string' and errorText or (data.message or 'Не удалось загрузить'))
     return false
   end
   local url = pickUrl(resp)
-  if url and url ~= '' then
-    if url:find('ibb.co', 1, true) or url:find('imgbb', 1, true) then
-      rememberImgbb(resp)
-    end
-    copyUrl(url)
-    chat(url)
-    return true
-  end
-  local id = resp:match('"id"%s*:%s*"(%w+)"')
-  if not id then
-    chat('Не удалось загрузить')
-    return false
-  end
+  if url then rememberImgbb(resp); copyUrl(url); chat(url); return true end
+  if type(data.id) ~= 'string' or type(data.url) ~= 'string' then chat('Не удалось загрузить'); return false end
   chat('Скрин во входящих')
   return true
 end
@@ -4045,11 +4125,14 @@ function startBgUpload(url, token, path, filename)
     end
     local f = io.open(path, 'rb')
     if not f then return false, 'no file' end
+    local size = f:seek('end')
+    if not size or size > 15 * 1024 * 1024 then f:close(); return false, 'file size' end
+    f:seek('set')
     local data = f:read('*a')
     f:close()
-    if not data or #data < 1000 then return false, 'empty' end
+    if not data or #data < 32 then return false, 'empty' end
     local mime = 'image/png'
-    if filename:sub(-4) == '.jpg' then mime = 'image/jpeg' end
+    if filename:lower():match('%.jpe?g$') then mime = 'image/jpeg' end
     if filename:sub(-4) == '.bmp' then mime = 'image/bmp' end
     local body = '{"image":"' .. b64encode(data) .. '","filename":"' .. filename .. '","mime":"' .. mime .. '","source":"samp"}'
     local ok_req, requests = pcall(require, 'requests')
@@ -4063,7 +4146,7 @@ function startBgUpload(url, token, path, filename)
       timeout = 60
     })
     if not ok then return false, tostring(resp) end
-    if resp and resp.text then return true, resp.text end
+    if resp and resp.text then return true, resp.text, tonumber(resp.status_code) end
     return false, 'empty resp'
   end)(url, token, path, filename)
 end
@@ -4100,9 +4183,12 @@ function startImgbbUpload(key, path, filename)
     end
     local f = io.open(path, 'rb')
     if not f then return false, 'no file' end
+    local size = f:seek('end')
+    if not size or size > 15 * 1024 * 1024 then f:close(); return false, 'file size' end
+    f:seek('set')
     local data = f:read('*a')
     f:close()
-    if not data or #data < 1000 then return false, 'empty' end
+    if not data or #data < 32 then return false, 'empty' end
     local body = 'key=' .. enc(key) .. '&image=' .. enc(b64encode(data)) .. '&name=' .. enc(filename)
     local ok_req, requests = pcall(require, 'requests')
     if not ok_req or not requests then return false, 'no requests' end
@@ -4114,144 +4200,109 @@ function startImgbbUpload(key, path, filename)
       timeout = 60
     })
     if not ok then return false, tostring(resp) end
-    if resp and resp.text then return true, resp.text end
+    if resp and resp.text then return true, resp.text, tonumber(resp.status_code) end
     return false, 'empty resp'
   end)(key, path, filename)
 end
 
-function waitRemote(runner, path, failMsg)
-  if not runner then
-    chat('Не удалось загрузить')
-    pcall(os.remove, path)
-    return
-  end
-  local t0 = os.clock()
-  while os.clock() - t0 < 90 do
-    local status, err = runner:status()
-    if err then
-      chat(failMsg)
-      pcall(os.remove, path)
-      return
+function awaitUpload(runner, timeout)
+  if not runner then return false, 'no worker' end
+  activeUpload = runner
+  local deadline = monotime() + (timeout or 90)
+  while monotime() < deadline do
+    local okStatus, status, err = pcall(function() return runner:status() end)
+    if not okStatus or err or status == 'failed' or status == 'cancelled' or status == 'canceled' then
+      activeUpload = nil
+      return false, tostring(err or status or 'worker error')
     end
     if status == 'completed' then
-      local ok, text = runner:get()
-      if ok then
-        handleUploadResp(text)
-      else
-        handleUploadResp(nil, text)
-      end
-      pcall(os.remove, path)
-      return
-    elseif status == 'canceled' then
-      chat('Не удалось загрузить')
-      pcall(os.remove, path)
-      return
+      activeUpload = nil
+      local okGet, success, text, code = pcall(function() return runner:get(0) end)
+      if not okGet then return false, 'worker result error' end
+      return success == true, text, code
     end
     wait(0)
   end
-  chat(failMsg)
-  pcall(os.remove, path)
+  pcall(function() runner:cancel(0) end)
+  activeUpload = nil
+  return false, 'timeout'
+end
+
+function uploadFallback(path, filename, key)
+  local f = io.open(path, 'rb')
+  if not f then return nil, 'no file' end
+  local size = f:seek('end')
+  if not size or size < 32 or size > 15 * 1024 * 1024 then f:close(); return nil, 'file size' end
+  f:seek('set')
+  local bytes = f:read('*a')
+  f:close()
+  if not bytes then return nil, 'read file' end
+  if key then
+    local function enc(value)
+      return (value:gsub('([^%w%-_%.~])', function(c) return string.format('%%%02X', c:byte()) end))
+    end
+    return httpPost('https://api.imgbb.com/1/upload', 'Content-Type: application/x-www-form-urlencoded',
+      'key=' .. enc(key) .. '&image=' .. enc(b64encode(bytes)) .. '&name=' .. enc(filename))
+  end
+  local mime = filename:lower():match('%.jpe?g$') and 'image/jpeg' or (filename:lower():match('%.bmp$') and 'image/bmp' or 'image/png')
+  return httpPost(SITE .. '/api/photos', 'Content-Type: application/json\r\n' .. authHead(),
+    '{"image":"' .. b64encode(bytes) .. '","filename":"' .. jsonEscape(filename) .. '","mime":"' .. mime .. '","source":"samp"}')
 end
 
 function queueUpload(path, ext)
-  if not path then return end
-  if useImgbb() then
-    local key = imgbbKey()
-    if key == '' then
-      chat('Укажите ключ ImgBB в /referenz')
-      openLoginWindow()
-      pcall(os.remove, path)
-      return
-    end
-    local filename = 'samp-' .. tostring(os.time()) .. (ext or '.jpg')
-    chat('Загружаю на ImgBB...')
-    waitRemote(startImgbbUpload(key, path, filename), path, 'ImgBB не ответил')
-    return
-  end
-  if not loggedIn() then
+  if not path then return false end
+  local imgbb = useImgbb()
+  local key = imgbb and imgbbKey() or nil
+  if imgbb and key == '' then chat('Укажите ключ ImgBB в /referenz'); openLoginWindow(); return false end
+  if not imgbb and not loggedIn() then
     if cfg.referenz.username ~= '' and cfg.referenz.password ~= '' then
       doAuth('login', cfg.referenz.username, cfg.referenz.password, true)
     end
+    if not loggedIn() then openLoginWindow(); return false end
   end
-  if not loggedIn() then
-    openLoginWindow()
-    pcall(os.remove, path)
-    return
-  end
-  local filename = 'samp-' .. tostring(os.time()) .. (ext or '.jpg')
-  chat('Загружаю...')
-  local token = cfg.referenz.token
-  local url = SITE .. '/api/photos'
-  local runner = startBgUpload(url, token, path, filename)
-  if runner then
-    local t0 = os.clock()
-    while os.clock() - t0 < 90 do
-      local status, err = runner:status()
-      if err then
-        chat('Нет связи с сайтом')
-        pcall(os.remove, path)
-        return
-      end
-      if status == 'completed' then
-        local ok, text = runner:get()
-        if ok then
-          if tostring(text):match('Нужно войти') and cfg.referenz.username ~= '' then
-            doAuth('login', cfg.referenz.username, cfg.referenz.password, true)
-            runner = startBgUpload(url, cfg.referenz.token, path, filename)
-            t0 = os.clock()
-          else
-            handleUploadResp(text)
-            pcall(os.remove, path)
-            return
-          end
-        else
-          handleUploadResp(nil, text)
-          pcall(os.remove, path)
-          return
-        end
-      elseif status == 'canceled' then
-        chat('Не удалось загрузить')
-        pcall(os.remove, path)
-        return
-      end
-      wait(0)
+  local gen = hub.loginGen or 0
+  local filename = 'samp-' .. tostring(os.time()) .. (ext or '.jpg'):lower()
+  chat(imgbb and 'Загружаю на ImgBB...' or 'Загружаю...')
+  for attempt = 1, 2 do
+    local okStart, runner = pcall(function()
+      if imgbb then return startImgbbUpload(key, path, filename) end
+      return startBgUpload(SITE .. '/api/photos', cfg.referenz.token, path, filename)
+    end)
+    local success, text, code
+    if okStart and runner then success, text, code = awaitUpload(runner, 90) end
+    if not runner or not okStart or (not success and text == 'no requests') then
+      local body, err, status = uploadFallback(path, filename, key)
+      success, text, code = body ~= nil, body or err, status
     end
-    chat('Нет связи с сайтом')
-    pcall(os.remove, path)
-    return
+    if gen ~= (hub.loginGen or 0) then return false end
+    if not imgbb and code == 401 and attempt == 1 then
+      if cfg.referenz.username == '' or cfg.referenz.password == '' or not doAuth('login', cfg.referenz.username, cfg.referenz.password, true) then
+        chat('Войдите заново через /referenz')
+        return false
+      end
+    else
+      if not success then return handleUploadResp(nil, text) end
+      return handleUploadResp(text)
+    end
   end
-  chat('Не удалось загрузить')
-  pcall(os.remove, path)
+  return false
 end
 
-function startUpload(src)
-  if busy or not src then return end
-  if useImgbb() then
-    if imgbbKey() == '' then
-      chat('Укажите ключ ImgBB в /referenz')
-      openLoginWindow()
-      return
-    end
-  elseif not loggedIn() then
-    if cfg.referenz.username ~= '' and cfg.referenz.password ~= '' then
-      doAuth('login', cfg.referenz.username, cfg.referenz.password, true)
-    end
-    if not loggedIn() then
-      openLoginWindow()
-      return
-    end
-  end
+function startUpload(src, reserved)
+  if not src then if reserved then busy = false end; return false end
+  if busy and not reserved then return false end
   busy = true
-  local tmp, ext = src, (src:match('(%.[^\\/%.]+)$') or '.jpg')
-  if not tostring(src):find('referenz_up', 1, true) then
-    tmp, ext = copyShot(src)
-  end
+  local tmp
+  local ok, result = pcall(function()
+    local ext = src:match('(%.[^\\/%.]+)$') or '.jpg'
+    if ownedShots[src] then tmp = src else tmp, ext = copyShot(src) end
+    if not tmp then chat('Не удалось прочитать скрин'); return false end
+    return queueUpload(tmp, ext)
+  end)
+  if tmp and ownedShots[tmp] then pcall(os.remove, tmp); ownedShots[tmp] = nil end
   busy = false
-  if not tmp then
-    chat('Не удалось прочитать скрин')
-    return
-  end
-  queueUpload(tmp, ext)
+  if not ok then chat('Ошибка загрузки. Попробуйте ещё раз.') end
+  return ok and result == true
 end
 
 function onD3DPresent()
@@ -4260,39 +4311,36 @@ function onD3DPresent()
   end
 end
 
-function onWindowMessage(msg, wparam)
-  if tonumber(wparam) ~= VK_F8 then return end
-  if msg ~= WM_KEYDOWN then return end
-  if windowOpen() then
-    needClose = true
-    return
-  end
-  if not f8Wait then
-    f8Clock = os.clock()
-    f8Wait = true
-  end
+function onWindowMessage(msg, wparam, lparam)
+  if tonumber(wparam) ~= VK_F8 or msg ~= WM_KEYDOWN then return end
+  if math.floor((tonumber(lparam) or 0) / 1073741824) % 2 == 1 then return end
+  if windowOpen() or (ui.hub and ui.hub[0]) or cefOpen then needClose = true; return end
+  if not busy and not f8Wait then f8Clock = monotime(); f8Wait = true end
 end
 
 function onDialogResponse(dialogId, button, list, input)
-  if dialogId ~= DLG_USER and dialogId ~= DLG_PASS then return end
-  if button ~= 1 then
-    authPending.mode = ''
-    return
-  end
-  input = tostring(input or ''):gsub('^%s+', ''):gsub('%s+$', '')
+  if (dialogId ~= DLG_USER and dialogId ~= DLG_PASS) or authPending.dialog ~= dialogId then return end
+  authPending.dialog = nil
+  if button ~= 1 and button ~= true then authPending.mode = ''; authPending.user = ''; return end
+  input = tostring(input or '')
   if dialogId == DLG_USER then
-    if input == '' then
-      chat('Логин пустой')
-      return
-    end
+    input = input:gsub('^%s+', ''):gsub('%s+$', '')
+    if input == '' then chat('Логин пустой'); openLoginWindow(); return end
     authPending.user = input
-    sampShowDialog(DLG_PASS, 3, ru('Вход referenz.pics'), ru('Введите пароль'), ru('Готово'), ru('Отмена'))
+    authPending.dialog = DLG_PASS
+    sampShowDialog(DLG_PASS, ru('Вход referenz.pics'), ru('Введите пароль'), ru('Готово'), ru('Отмена'), 3)
     return
   end
-  lua_thread.create(function()
-    doAuth('login', authPending.user, input)
-    authPending.mode = ''
-  end)
+  local user = authPending.user
+  authPending.mode, authPending.user = '', ''
+  submitAuth('login', user, input)
+end
+
+function pollLoginDialogs()
+  local id = authPending.dialog
+  if not id or type(sampHasDialogRespond) ~= 'function' then return end
+  local ok, responded, button, list, input = pcall(sampHasDialogRespond, id)
+  if ok and responded then onDialogResponse(id, button, list, input) end
 end
 
 updateBusy = false
@@ -4304,107 +4352,108 @@ function updateIsHtml(s)
   return s:sub(1, 9) == '<!doctype' or s:sub(1, 5) == '<html'
 end
 
-function updateFetch(urls, minLen)
+function scriptBodyVersion(body)
+  return type(body) == 'string' and body:match("script_version%s*%(%s*['\"]([^'\"]+)['\"]%s*%)") or nil
+end
+
+function versionNewer(candidate, current)
+  local function parts(value)
+    value = tostring(value or '')
+    if #value > 40 or not value:match('^%d+[.%d]*$') or value:sub(-1) == '.' or value:find('..', 1, true) then return nil end
+    local out = {}
+    for n in value:gmatch('%d+') do out[#out + 1] = tonumber(n) end
+    return out
+  end
+  local a, b = parts(candidate), parts(current)
+  if not a or not b then return false end
+  for i = 1, math.max(#a, #b) do
+    local av, bv = a[i] or 0, b[i] or 0
+    if av ~= bv then return av > bv end
+  end
+  return false
+end
+
+local pendingUpdateVersion
+
+function updateFetch(urls, minLen, expectedVersion)
   for i = 1, #urls do
-    local body = httpGet(urls[i] .. ((urls[i]:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.time())))
-    body = tostring(body or '')
-    if body ~= '' and #body >= (minLen or 8) and not updateIsHtml(body) then
-      return body
-    end
+    local url = urls[i] .. (urls[i]:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.time())
+    local body, _, status = httpGet(url)
+    if type(body) == 'string' and status == 200 and #body >= (minLen or 8) and not updateIsHtml(body)
+      and (not expectedVersion or scriptBodyVersion(body) == expectedVersion) then return body end
   end
   return nil
 end
 
 function updateWriteFile(latest, body)
-  if type(body) ~= 'string' or #body < 4000
-    or not body:find('script_name', 1, true) or not body:find('function main', 1, true) then
-    chat('Обновление прошло неудачно. Запускаю текущую версию.')
+  if pendingUpdateVersion then chat('Обновление уже записано. Нажмите Ctrl+R.'); return false end
+  if type(body) == 'string' and body:sub(1, 3) == '\239\187\191' then body = body:sub(4) end
+  if type(body) ~= 'string' or #body < 4000 or not body:find('script_name', 1, true)
+    or not body:find('function main', 1, true) or scriptBodyVersion(body) ~= latest or not loadstring(body) then
+    chat('Файл обновления повреждён или имеет другую версию. Текущий скрипт сохранён.')
     return false
   end
   local path = thisScript().path
-  if type(path) ~= 'string' or path == '' then
-    chat('Нет пути скрипта')
+  if type(path) ~= 'string' or path == '' then chat('Нет пути скрипта'); return false end
+  local function writeChecked(target, bytes)
+    local f = io.open(target, 'wb')
+    if not f then return false end
+    local okWrite, written = pcall(function() return f:write(bytes) end)
+    local okClose, closed = pcall(function() return f:close() end)
+    if not okWrite or not written or not okClose or not closed then pcall(os.remove, target); return false end
+    local verify = io.open(target, 'rb')
+    if not verify then return false end
+    local actual = verify:read('*a')
+    verify:close()
+    return actual == bytes
+  end
+  local old = io.open(path, 'rb')
+  if not old then chat('Не удалось прочитать текущий скрипт'); return false end
+  local previous = old:read('*a')
+  old:close()
+  if not previous or not writeChecked(path .. '.bak', previous) then chat('Не удалось сохранить резервную копию'); return false end
+  local staged = path .. '.new'
+  if not writeChecked(staged, body) then chat('Не записалось обновление. Текущий скрипт сохранён.'); return false end
+  if kernel32.MoveFileExW(wide(staged), wide(path), 0x1 + 0x8) == 0 then
+    pcall(os.remove, staged)
+    chat('Не удалось заменить файл. Текущий скрипт сохранён.')
     return false
   end
-  pcall(function()
-    local old = io.open(path, 'rb')
-    if old then
-      local prev = old:read('*a')
-      old:close()
-      local b = io.open(path .. '.bak', 'wb')
-      if b then
-        b:write(prev)
-        b:close()
-      end
-    end
-  end)
-  local f = io.open(path, 'wb')
-  if not f then
-    chat('Не записалось обновление')
-    return false
-  end
-  f:write(body)
-  f:close()
-  chat(('Файл обновлён до %s.'):format(latest))
-  chat('Перезагрузи скрипт: Ctrl+R или /reload.')
-  chat('Не жми обновление повторно, пока не сделаешь Ctrl+R.')
+  pendingUpdateVersion = latest
+  chat(('Файл обновлён до %s. Резервная копия: .bak'):format(latest))
+  chat('Перезагрузите скрипт: Ctrl+R или /reload.')
   return true
 end
 
 function checkUpdate(manual)
-  if updateBusy then
-    if manual then chat('Обновление уже идёт') end
-    return
-  end
+  if updateBusy then if manual then chat('Обновление уже идёт') end; return end
+  if pendingUpdateVersion then if manual then chat('Обновление уже записано. Нажмите Ctrl+R.') end; return end
   updateBusy = true
-  if manual then chat('Проверяю GitHub…') end
+  if manual then chat('Проверяю обновление…') end
   lua_thread.create(function()
-    local raw = updateFetch({
-      UPDATE_JSON,
-      'https://cdn.jsdelivr.net/gh/andergr0ynd/referenz.pics@main/version.json',
-    }, 8)
-    if type(raw) ~= 'string' then
-      updateBusy = false
-      if manual then chat('GitHub недоступен') end
-      return
-    end
-    local latest = raw:match('"latest"%s*:%s*"([^"]+)"')
-    local updateurl = raw:match('"updateurl"%s*:%s*"([^"]+)"')
-    if not latest or latest == '' then
-      updateBusy = false
-      if manual then chat('Не прочитался version.json') end
-      return
-    end
-    local cur = tostring(thisScript().version or '0')
-    if latest == cur then
-      updateBusy = false
-      if manual then chat(('Уже актуальная версия %s'):format(cur)) end
-      return
-    end
-    if not updateurl or updateurl == '' or not updateurl:find('^https?://') then
-      updateurl = UPDATE_LUA
-    end
-    chat(('Есть обновление: %s -> %s'):format(cur, latest))
-    local body = updateFetch({
-      updateurl,
-      UPDATE_LUA,
-      'https://cdn.jsdelivr.net/gh/andergr0ynd/referenz.pics@main/referenz.pics.lua',
-    }, 4000)
-    if type(body) ~= 'string' then
-      updateBusy = false
-      chat('Не скачался новый скрипт')
-      return
-    end
-    updateWriteFile(latest, body)
+    local ok = pcall(function()
+      local raw = updateFetch({ UPDATE_JSON, 'https://cdn.jsdelivr.net/gh/andergr0ynd/referenz.pics@main/version.json' }, 8)
+      local info = parseJson(raw)
+      if not info or type(info.latest) ~= 'string' then if manual then chat('Не удалось проверить обновление') end; return end
+      local latest = info.latest
+      local cur = tostring(thisScript().version or '0')
+      if not versionNewer(latest, cur) then if manual then chat(('Уже актуальная версия %s'):format(cur)) end; return end
+      local url = type(info.updateurl) == 'string' and info.updateurl:find('^https://') and info.updateurl or UPDATE_LUA
+      chat(('Есть обновление: %s -> %s'):format(cur, latest))
+      local body = updateFetch({ url, UPDATE_LUA, 'https://cdn.jsdelivr.net/gh/andergr0ynd/referenz.pics@main/referenz.pics.lua' }, 4000, latest)
+      if not body then chat('Не скачался новый скрипт нужной версии'); return end
+      updateWriteFile(latest, body)
+    end)
     updateBusy = false
+    if not ok then chat('Ошибка проверки обновления. Текущий скрипт сохранён.') end
   end)
 end
 
 function startAutoUpdate()
   if tostring(cfg.referenz.autoUpdate or '1') == '0' then return end
   lua_thread.create(function()
-    local t0 = os.clock()
-    while os.clock() - t0 < 45 do wait(500) end
+    local t0 = monotime()
+    while monotime() - t0 < 45 do wait(500) end
     for _ = 1, 60 do
       local spawned = false
       pcall(function()
@@ -4436,7 +4485,13 @@ end
 function onScriptTerminate(script)
   if script ~= thisScript() then return end
   cefOpen = false
-  killBrowseHelper()
+  if loginJob then pcall(function() loginJob.th:cancel(0) end) end
+  if thumbThread then pcall(function() thumbThread.th:cancel(0) end) end
+  if activeUpload then pcall(function() activeUpload:cancel(0) end) end
+  for worker in pairs(httpJobs) do pcall(function() worker:cancel(0) end) end
+  pcall(killBrowseHelper)
+  for path in pairs(ownedShots) do pcall(os.remove, path) end
+  if gdiplus and gdipToken[0] ~= nil then pcall(function() gdiplus.GdiplusShutdown(gdipToken[0]) end); gdiplus = nil end
 end
 
 function startQuietLogin()
@@ -4460,20 +4515,23 @@ function startQuietLogin()
     end)(url, payload)
   end)
   if ok and th then
-    loginJob = { th = th, user = user, pass = pass, gen = hub.loginGen or 0 }
+    loginJob = { th = th, user = user, pass = pass, gen = hub.loginGen or 0, deadline = monotime() + 30 }
   end
 end
 
 function pollQuietLogin()
   local job = loginJob
   if not job then return end
-  local status
-  local okStatus = pcall(function() status = job.th:status() end)
-  if not okStatus or status == nil or status == 'running' or status == 'paused' then return end
+  if job.gen ~= (hub.loginGen or 0) or monotime() >= job.deadline then
+    pcall(function() job.th:cancel(0) end)
+    loginJob = nil
+    return
+  end
+  local okStatus, status = pcall(function() return job.th:status() end)
+  if okStatus and (status == 'running' or status == 'paused') then return end
   loginJob = nil
-  if job.gen ~= (hub.loginGen or 0) then return end
-  if status ~= 'completed' then return end
-  local ok, text = pcall(function() return job.th:get() end)
+  if not okStatus or status ~= 'completed' then return end
+  local ok, text = pcall(function() return job.th:get(0) end)
   if ok then finishAuth(text, 'login', job.user, job.pass, true) end
 end
 
@@ -4511,6 +4569,7 @@ function main()
     pumpThumbs()
     pumpLogo()
     flushClip()
+    pollLoginDialogs()
     pollQuietLogin()
     if dropHub then
       dropHub = false
@@ -4528,17 +4587,22 @@ function main()
     elseif needClose then
       needClose = false
       pcall(closeWindow)
+      pcall(closeReferenzHub)
       chat('Закройте окно и нажмите F8 ещё раз')
     elseif f8Wait then
       f8Wait = false
-      lua_thread.create(function()
-        local path = takeGdiShot()
-        if not path then
-          chat('Не удалось снять кадр')
-          return
-        end
-        startUpload(path)
-      end)
+      if not busy then
+        busy = true
+        lua_thread.create(function()
+          local ok, path = pcall(takeGdiShot)
+          if not ok or not path then
+            busy = false
+            chat('Не удалось снять кадр. Откройте окно игры и повторите F8.')
+            return
+          end
+          startUpload(path, true)
+        end)
+      end
     else
       takeThumb()
     end
