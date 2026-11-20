@@ -1,0 +1,58 @@
+name: Ошибка в referenz.pics
+description: Не работает вход, F8, загрузка снимка или интерфейс скрипта
+title: "[Ошибка] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Опишите ошибку в игровом скрипте referenz.pics. Не прикладывайте пароли, API-ключи и referenz.ini.
+        Установка и команды: [README](https://github.com/andergr0ynd/referenz.pics#install).
+  - type: input
+    id: version
+    attributes:
+      label: Версия скрипта
+      placeholder: Например, 2.79
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Клиент и сборка
+      description: Версия Windows, SA-MP / лаунчер и версия MoonLoader, если известны
+      placeholder: Например, Windows 11, Arizona Launcher, MoonLoader
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Где возникает ошибка?
+      options:
+        - Вход / регистрация
+        - Скриншот F8
+        - Загрузка на сайт
+        - Загрузка на ImgBB
+        - Снимки / альбомы
+        - Форумы / WebView2
+        - Обновление скрипта
+        - Другое
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить?
+      description: Что сделали, что ожидали и что произошло вместо этого
+      placeholder: "1. Ввёл /referenz…"
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Текст ошибки
+      description: Строки из moonloader.log, относящиеся к referenz.pics. Удалите личные данные и ключи.
+      render: text
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Снимок экрана или дополнительные сведения
+      description: При необходимости перетащите снимок, скрыв личные данные.
